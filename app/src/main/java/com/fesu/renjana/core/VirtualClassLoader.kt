@@ -100,40 +100,24 @@ class VirtualClassLoader(
         ClassLoader.getSystemClassLoader()
     }
 
-    /**
-     * Load a class from the guest APK
-     */
-    override fun loadClass(name: String): Class<*> {
-        return loadClass(name, false)
-    }
+    /** Load a class from the guest APK. */
+    override fun loadClass(name: String): Class<*> = loadClass(name, false)
 
-    /**
-     * Load a class from the guest APK with resolve flag
-     */
+    /** Load a class from the guest APK with resolve flag. */
     override fun loadClass(name: String, resolve: Boolean): Class<*> {
-        // Try to load from guest APK first
         return try {
             val clazz = dexClassLoader.loadClass(name)
-            if (resolve) {
-                resolveClass(clazz)
-            }
+            if (resolve) resolveClass(clazz)
             clazz
         } catch (e: ClassNotFoundException) {
-            // Fall back to parent (system classes)
             super.loadClass(name, resolve)
         }
     }
 
-    /**
-     * Find a class in the guest APK
-     */
-    override fun findClass(name: String): Class<*> {
-        return dexClassLoader.loadClass(name)
-    }
+    /** Find a class in the guest APK. */
+    override fun findClass(name: String): Class<*> = dexClassLoader.loadClass(name)
 
-    /**
-     * Get resources from the guest APK
-     */
+    /** Get resources from the guest APK. */
     fun getResources(context: android.content.Context): Resources {
         if (resources == null) {
             resources = createResources(context)
@@ -141,50 +125,42 @@ class VirtualClassLoader(
         return resources!!
     }
 
-    /**
-     * Get AssetManager from the guest APK
-     */
+    /** Get AssetManager from the guest APK. */
     fun getAssets(): AssetManager {
         if (assetManager == null) {
-            if (resources != null) {
-                assetManager = resources!!.assets
-            } else {
-                assetManager = createAssetManager()
-            }
+            assetManager = resources?.assets ?: createAssetManager()
         }
         return assetManager!!
     }
 
-    /**
-     * Create AssetManager for the guest APK
-     * Uses reflection to access hidden Android APIs
-     */
+    /** Create AssetManager for the guest APK using reflection to access hidden APIs. */
     private fun createAssetManager(): AssetManager {
         try {
-            // AssetManager() constructor is package-private, use reflection
-            val ctor = AssetManager::class.java.getDeclaredConstructor()
-            ctor.isAccessible = true
-            val assetManager = ctor.newInstance()
+            val ctor = AssetManager::class.java.getDeclaredConstructor().apply { isAccessible = true }
+            val createdAssetManager = ctor.newInstance()
             val addAssetPathMethod = AssetManager::class.java.getDeclaredMethod(
                 "addAssetPath",
                 String::class.java
-            )
-            addAssetPathMethod.isAccessible = true
+            ).apply { isAccessible = true }
             var successfulPaths = 0
             for (path in allApkPaths) {
                 try {
-                    val result = addAssetPathMethod.invoke(assetManager, path) as? Int
-                    if (result != null && result != 0) successfulPaths++
-                    com.fesu.renjana.utils.RenjanaLog.i("VirtualClassLoader", "Added asset path: $path (cookie=$result)")
+                    val cookie = addAssetPathMethod.invoke(createdAssetManager, path) as? Int
+                    if (cookie != null && cookie != 0) successfulPaths++
+                    com.fesu.renjana.utils.RenjanaLog.i(
+                        "VirtualClassLoader", "Added asset path: $path (cookie=$cookie)"
+                    )
                 } catch (e: Exception) {
-                    com.fesu.renjana.utils.RenjanaLog.w("VirtualClassLoader", "Failed to add asset path $path: ${e.message}")
+                    com.fesu.renjana.utils.RenjanaLog.w(
+                        "VirtualClassLoader", "Failed to add asset path $path: ${e.message}"
+                    )
                 }
             }
             if (successfulPaths == 0) {
                 throw IllegalStateException("AssetManager accepted none of the APK paths: $allApkPaths")
             }
-            assetManager = assetManager
-            return assetManager
+            assetManager = createdAssetManager
+            return createdAssetManager
         } catch (e: Exception) {
             throw RuntimeException("Failed to create AssetManager for $apkPath", e)
         }
@@ -254,11 +230,8 @@ class VirtualClassLoader(
         }
     }
 
-    /**
-     * Set native library path for loading .so files
-     */
+    /** Set native library path for loading .so files. */
     fun setLibraryPath(libPath: String) {
-        // Use reflection to set library path in DexClassLoader
         try {
             val pathListField = DexClassLoader::class.java.superclass
                 .getDeclaredField("pathList")
@@ -274,27 +247,18 @@ class VirtualClassLoader(
             newDirs.add(File(libPath))
             nativeLibraryDirectoriesField.set(pathList, newDirs)
         } catch (e: Exception) {
-            // Failed to set library path, native libs won't load
             println("Warning: Failed to set library path: ${e.message}")
         }
     }
 
-    /**
-     * Load a specific class by name from the guest APK
-     */
-    fun loadGuestClass(className: String): Class<*> {
-        return dexClassLoader.loadClass(className)
-    }
+    /** Load a specific class by name from the guest APK. */
+    fun loadGuestClass(className: String): Class<*> = dexClassLoader.loadClass(className)
 
-    /**
-     * Check if a class exists in the guest APK
-     */
-    fun hasClass(className: String): Boolean {
-        return try {
-            dexClassLoader.loadClass(className)
-            true
-        } catch (e: ClassNotFoundException) {
-            false
-        }
+    /** Check if a class exists in the guest APK. */
+    fun hasClass(className: String): Boolean = try {
+        dexClassLoader.loadClass(className)
+        true
+    } catch (e: ClassNotFoundException) {
+        false
     }
 }
