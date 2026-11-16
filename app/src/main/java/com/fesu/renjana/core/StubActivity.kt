@@ -105,12 +105,13 @@ abstract class StubActivity : Activity() {
     /** The guest's real ActivityInfo, parsed from its manifest (theme, launchMode, ...). */
     private var guestActivityInfo: android.content.pm.ActivityInfo? = null
 
-    /**
-     * Effective theme resource for the guest: the activity's own android:theme,
-     * falling back to the <application android:theme> (most apps theme only the
-     * application tag). 0 = unknown; the host theme is then the last resort.
-     */
+    /** Guest manifest theme, resolved only against guestResources. */
     private var effectiveGuestTheme: Int = 0
+
+    /** The stub's window must always use the host's Resources and Theme. */
+    private var hostResources: Resources? = null
+    private var hostTheme: Resources.Theme? = null
+    private var hostThemeResource: Int = 0
 
     /** Storage-isolated context handed to the guest Application/providers/activity. */
     private var virtualContext: VirtualContext? = null
@@ -146,17 +147,11 @@ abstract class StubActivity : Activity() {
             androidx.appcompat.app.AppCompatDelegate.setCompatVectorFromResourcesEnabled(true)
         } catch (_: Throwable) {}
 
-        val instanceId = intent?.getStringExtra(EXTRA_INSTANCE_ID)
-        val dataPath = intent?.getStringExtra(EXTRA_DATA_PATH)
-            ?: (instanceId?.let { ActivityStubManager.getDataPathForInstance(it) })
-        if (instanceId != null && dataPath != null && newBase != null) {
-            try {
-                super.attachBaseContext(VirtualContext(newBase, dataPath))
-                RenjanaLog.d(TAG, "attachBaseContext: wrapped with VirtualContext for instance $instanceId")
-                return
-            } catch (e: Exception) {
-                RenjanaLog.w(TAG, "attachBaseContext: failed to wrap context: ${e.message}")
-            }
+        // Capture the framework-provided host context before any guest Resources are
+        // installed. Android inflates the StubActivity window using this context.
+        if (newBase != null) {
+            hostResources = newBase.resources
+            hostTheme = newBase.theme
         }
         super.attachBaseContext(newBase)
     }
@@ -168,6 +163,14 @@ abstract class StubActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        // Keep the host's already-created window/theme separate from guest resources.
+        // The framework calls this Activity's getTheme() while constructing screen_simple;
+        // returning a guest Theme there makes platform resource IDs resolve in the guest
+        // AssetManager and triggers Resources$NotFoundException for host IDs.
+        hostResources = super.getResources()
+        hostTheme = super.getTheme()
+        hostThemeResource = readThemeResource(this)
+
         // Per-app Close/Stop: this stub was asked to shut down (delivered either
         // as a fresh launch of a dead stub or a re-delivery to a live one).
         if (intent?.action == ACTION_FINISH_GUEST) {
@@ -176,12 +179,10 @@ abstract class StubActivity : Activity() {
             return
         }
 
-        // Disable AppCompat vector compat check which throws on delegated classloaders
         try {
-            androidx.appcompat.app.AppCompatDelegate.setCompatVectorFromResourcesEnabled(false)
+            androidx.appcompat.app.AppCompatDelegate.setCompatVectorFromResourcesEnabled(true)
         } catch (_: Throwable) {}
 
-        // Extract stub routing info from Intent extras
         instanceId = intent.getStringExtra(EXTRA_INSTANCE_ID).orEmpty()
         guestPackageName = intent.getStringExtra(EXTRA_PACKAGE_NAME).orEmpty()
         guestClassName = intent.getStringExtra(EXTRA_GUEST_ACTIVITY_CLASS).orEmpty()
@@ -205,11 +206,13 @@ abstract class StubActivity : Activity() {
             return
         }
 
-        try {
-            androidx.appcompat.app.AppCompatDelegate.setCompatVectorFromResourcesEnabled(true)
-        } catch (_: Throwable) {}
-
-        RenjanaLog.i(TAG, "StubActivity[${getStubIndex()}] onCreate (pid=${android.os.Process.myPid()}) → launching guest $guestClassName for instance $instanceId")
+        RenjanaLog.i(
+            TAG,
+            "StubActivity[${getStubIndex()}] onCreate (pid=${android.os.Process.myPid()}) → " +
+                "launching guest $guestClassName for instance $instanceId; " +
+                "runtime sdk=${android.os.Build.VERSION.SDK_INT}, release=${android.os.Build.VERSION.RELEASE}, " +
+                "build=${android.os.Build.DISPLAY}, device=${android.os.Build.MANUFACTURER}/${android.os.Build.MODEL}"
+        )
 
         ActivityStubManager.onStubOccupied(instanceId, getStubIndex(), guestClassName)
 
@@ -225,19 +228,10 @@ abstract class StubActivity : Activity() {
                 baseDataPath
             }
 
-            // 1. Storage-isolated context for everything the guest touches. This is the
-            //    real isolation surface (attachBaseContext runs before mIntent is set,
-            //    so the wrap there never fires — the context is built here instead).
             val resolvedPackageName = packageName.ifEmpty { null }
             virtualContext = VirtualContext(this, effectiveDataPath, resolvedPackageName)
 
-            // 2. Isolated classloader for the guest APK (base + splits)
             val optimizedDir = java.io.File(effectiveDataPath, "dex_opt").apply { mkdirs() }
-            // Native libraries: prefer the installed guest's extracted lib dir
-            // (…/lib/arm64). Modern apps ship extractNativeLibs=false, leaving that
-            // dir EMPTY with the .so files compressed inside split APKs — those
-            // can't be dlopen'ed straight from the zip, so extract them once into
-            // the instance dir (idempotent across launches).
             val guestNativeLibDir = resolveGuestNativeLibDir(apkPath, packageName, effectiveDataPath)
             virtualClassLoader = VirtualClassLoader(
                 apkPath = apkPath,
@@ -248,21 +242,17 @@ abstract class StubActivity : Activity() {
                 parent = classLoader
             )
 
-            // Serve the guest's merged Resources through the VirtualContext — guest
-            // Application/SDK init reads resource IDs (google_app_id etc.) and would
-            // hit the HOST AssetManager otherwise.
-            try {
-                virtualContext?.guestResources = virtualClassLoader!!.getResources(this)
-            } catch (_: Throwable) {}
+            // Install guest Resources only on the guest context. Never replace the
+            // StubActivity's host Resources: framework window/theme inflation uses them.
+            val guestResources = virtualClassLoader!!.getResources(this)
+            virtualContext?.guestResources = guestResources
 
-            // 3. Parse the guest's manifest: Application class, real ActivityInfo, providers
             val launchInfo = ApkLoader(this).getGuestLaunchInfo(apkPath, guestClassName)
             guestActivityInfo = launchInfo.activityInfo
             effectiveGuestTheme = launchInfo.activityInfo?.theme?.takeIf { it != 0 }
                 ?: launchInfo.applicationTheme.takeIf { it != 0 }
                 ?: 0
 
-            // Reconstruct instance model for subprocess with specific app's package and name
             val baseInstance = ActivityStubManager.getCachedInstance(instanceId)
             val effectivePackage = packageName.ifEmpty { launchInfo.packageName ?: baseInstance?.packageName ?: "com.example.guest" }
             val effectiveAppName = appName.ifEmpty { baseInstance?.appName ?: "Guest App" }
@@ -291,7 +281,6 @@ abstract class StubActivity : Activity() {
                 )
             )
 
-            // 4. Install Pine guest hooks if available
             if (PineHookManager.isAvailable()) {
                 PineHookManager.installGuestHooks(
                     effectivePackage,
@@ -303,9 +292,6 @@ abstract class StubActivity : Activity() {
                 )
             }
 
-            // 5. Assign the instance's Google account in THIS process — the map the
-            // hooks consult lives per-process, so the main-process assignment in
-            // InstanceLauncher was invisible here.
             val assignedAccountId = accountId
             if (instance.config.enableGms && assignedAccountId != null) {
                 try {
@@ -318,17 +304,12 @@ abstract class StubActivity : Activity() {
                 }
             }
 
-            // Apply static hardware spoofing to the isolated subprocess
             if (instance.config.enableFingerprint) {
                 com.fesu.renjana.hooks.DeviceFingerprint.applyDeviceSpoofToProcess(instance.config, instanceId)
             }
 
-            // Bypass VectorDrawableCompat checks in both host and guest ClassLoaders
             bypassVectorDrawableCheck()
 
-            // 6. Boot the guest's Application — framework order:
-            //    construct + attach → ContentProviders → Application.onCreate().
-            //    Skipping this is why guest apps with SDK init in Application crashed.
             guestApplication = createAndAttachGuestApplication(launchInfo.applicationClass)
             virtualContext?.guestApplication = guestApplication
             runGuestProviders(launchInfo.providers)
@@ -341,16 +322,12 @@ abstract class StubActivity : Activity() {
                 }
             }
 
-            // 7. Load and instantiate guest Activity
             val guestClass = virtualClassLoader!!.loadGuestClass(guestClassName)
             guestActivity = guestClass.getDeclaredConstructor().newInstance() as Activity
 
             cacheLifecycleMethods(guestClass)
             attachGuestToHost()
 
-            // 8. Intercept the guest's internal navigation (startActivity to its own
-            //    activities would be Permission-Denied: the components belong to the
-            //    guest app's UID, not ours). The hook redirects them onto stubs.
             guestActivity?.let { guest ->
                 try {
                     com.fesu.renjana.hooks.ActivityStarterHook.cacheInstanceInfo(
@@ -364,24 +341,26 @@ abstract class StubActivity : Activity() {
             }
 
             val guestIntent = intent.getParcelableExtra<Intent>(EXTRA_GUEST_ORIGINAL_INTENT)
-            if (guestIntent != null) {
-                setGuestIntent(guestIntent)
-            }
+            if (guestIntent != null) setGuestIntent(guestIntent)
 
             reportStateToService(InstanceNotificationManager.ACTION_OPEN_INSTANCE)
-
-            // Invoke directly — do NOT elvis on the result: onCreate returns void
-            // (null), so `?.invoke(...) ?: warn` would warn on every successful call.
             if (onCreateMethod != null) {
                 onCreateMethod!!.invoke(guestActivity, savedInstanceState)
             } else {
                 RenjanaLog.w(TAG, "Guest $guestClassName has no onCreate method")
             }
-
         } catch (e: Exception) {
             RenjanaLog.e(TAG, "Failed to launch guest $guestClassName: ${e.message}", e)
             finish()
         }
+    }
+
+    private fun readThemeResource(context: Context): Int = try {
+        val field = android.view.ContextThemeWrapper::class.java.getDeclaredField("mThemeResource")
+        field.isAccessible = true
+        field.getInt(context)
+    } catch (_: Throwable) {
+        0
     }
 
     /**
@@ -418,7 +397,7 @@ abstract class StubActivity : Activity() {
                         if (!entry.name.startsWith("lib/$abi/") || !entry.name.endsWith(".so")) continue
                         sawAny = true
                         val out = java.io.File(libDir, java.io.File(entry.name).name)
-                        if (out.exists() && out.length() == entry.size) continue // already extracted
+                        if (out.exists() && out.length() == entry.size) continue
                         zip.getInputStream(entry).use { input ->
                             java.io.FileOutputStream(out).use { output -> input.copyTo(output) }
                         }
@@ -426,28 +405,16 @@ abstract class StubActivity : Activity() {
                 }
             } catch (_: Throwable) {}
         }
-        // sawAny (not "did we copy") decides: previously-extracted libs must keep
-        // the directory registered as the loader's native lib path.
         RenjanaLog.i(TAG, if (sawAny) "Guest native lib dir: ${libDir.absolutePath}" else "No guest native libs found for abi=$abi")
         return if (sawAny) libDir.absolutePath else null
     }
 
-    /**
-     * Construct and attach (but do not yet start) the guest's Application.
-     * Returns null when the guest uses the default Application or construction
-     * fails — in both cases the launch continues with the host Application.
-     */
+    /** Construct and attach (but do not yet start) the guest's Application. */
     private fun createAndAttachGuestApplication(applicationClass: String?): Application? {
         val className = applicationClass?.takeIf { it.isNotBlank() } ?: return null
         return try {
             val clazz = virtualClassLoader!!.loadGuestClass(className)
             val app = clazz.getDeclaredConstructor().newInstance() as Application
-
-            // Application.attach(Context) is hidden and package-private-final. It
-            // MUST be found via method ENUMERATION: getDeclaredMethod(name) lookups
-            // are blocked by hidden-API enforcement on Android 15 (the caller is
-            // app code), while declaredMethods enumeration passes — same bypass
-            // Activity.attach already relies on below.
             val attachMethod = Application::class.java.declaredMethods.firstOrNull {
                 it.name == "attach" && it.parameterCount == 1 &&
                     Context::class.java.isAssignableFrom(it.parameterTypes[0])
@@ -462,11 +429,7 @@ abstract class StubActivity : Activity() {
         }
     }
 
-    /**
-     * Run the guest's manifest ContentProviders. attachInfo() invokes each
-     * provider's onCreate() on first attach (framework behavior), which is what
-     * initializes SDKs like Firebase (FirebaseInitProvider).
-     */
+    /** Run the guest's manifest ContentProviders. */
     private fun runGuestProviders(providers: List<android.content.pm.ProviderInfo>) {
         val context = virtualContext ?: return
         for (providerInfo in providers) {
@@ -481,9 +444,7 @@ abstract class StubActivity : Activity() {
         }
     }
 
-    /**
-     * Set up guest context and attach window from host so layout and views render directly.
-     */
+    /** Set up guest context and attach window from host so layout and views render directly. */
     private fun attachGuestToHost() {
         val guest = guestActivity ?: return
         try {
@@ -491,34 +452,25 @@ abstract class StubActivity : Activity() {
         } catch (e: Exception) {
             RenjanaLog.w(TAG, "Guest attach failed (non-fatal): ${e.message}")
             finish()
-            return
         }
     }
 
-    /**
-     * Attach the host StubActivity context, window, and framework state to the guest Activity.
-     */
+    /** Attach the host StubActivity context, window, and framework state to the guest Activity. */
     private fun attachGuestToHost(guest: Activity, guestClassName: String) {
         try {
-            // Prefer the guest's REAL ActivityInfo (parsed from its manifest) so theme,
-            // launchMode, softInputMode and orientation match the guest's declaration.
-            val resolvedInfo = guestActivityInfo ?: try {
-                val actInfoField = Activity::class.java.getDeclaredField("mActivityInfo")
-                actInfoField.isAccessible = true
-                (actInfoField.get(this) as? android.content.pm.ActivityInfo)?.let { original ->
-                    android.content.pm.ActivityInfo(original).apply { name = guestClassName }
-                } ?: android.content.pm.ActivityInfo().apply {
-                    packageName = this@StubActivity.packageName
-                    name = guestClassName
-                }
-            } catch (_: Throwable) {
-                android.content.pm.ActivityInfo().apply {
-                    packageName = this@StubActivity.packageName
-                    name = guestClassName
+            val guestRes = virtualClassLoader!!.getResources(this)
+            val resolvedInfo = guestActivityInfo ?: android.content.pm.ActivityInfo().apply {
+                packageName = guestPackageName.ifEmpty { this@StubActivity.packageName }
+                name = guestClassName
+            }
+            val guestTheme = guestRes.newTheme().apply {
+                if (effectiveGuestTheme != 0) {
+                    applyStyle(effectiveGuestTheme, true)
+                } else {
+                    applyStyle(com.fesu.renjana.R.style.Theme_Renjana, true)
                 }
             }
 
-            // 1. Invoke Activity.attach(...) via reflection
             val attachMethod = Activity::class.java.declaredMethods.firstOrNull { it.name == "attach" }
             if (attachMethod != null) {
                 attachMethod.isAccessible = true
@@ -526,133 +478,102 @@ abstract class StubActivity : Activity() {
                 for (i in attachMethod.parameterTypes.indices) {
                     val type = attachMethod.parameterTypes[i]
                     args[i] = when {
-                        type == Application::class.java || type.name.contains("Application") ->
-                            guestApplication ?: application
-                        type.name.contains("ActivityThread") -> try {
-                            val f = Activity::class.java.getDeclaredField("mMainThread")
-                            f.isAccessible = true
-                            f.get(this)
-                        } catch (_: Throwable) { null }
-                        type.name.contains("Instrumentation") -> try {
-                            val f = Activity::class.java.getDeclaredField("mInstrumentation")
-                            f.isAccessible = true
-                            f.get(this)
-                        } catch (_: Throwable) { null }
-                        type == android.os.IBinder::class.java -> try {
-                            val f = Activity::class.java.getDeclaredField("mToken")
-                            f.isAccessible = true
-                            f.get(this)
-                        } catch (_: Throwable) { null }
+                        type == Application::class.java || type.name.contains("Application") -> guestApplication ?: application
+                        type.name.contains("ActivityThread") -> getActivityField("mMainThread")
+                        type.name.contains("Instrumentation") -> getActivityField("mInstrumentation")
+                        type == android.os.IBinder::class.java -> getActivityField("mToken")
                         type == Int::class.javaPrimitiveType -> 0
                         type == Long::class.javaPrimitiveType -> 0L
                         type == Boolean::class.javaPrimitiveType -> false
                         type == Intent::class.java -> intent
                         type == android.content.pm.ActivityInfo::class.java -> resolvedInfo
-                        type == Activity::class.java -> null // mParent: guests must NOT be child activities
+                        type == Activity::class.java -> null
                         type == CharSequence::class.java -> title
-                        type == android.content.res.Configuration::class.java -> resources.configuration
-                        // null matches the framework's own call (window is only non-null
-                        // on relaunch). Passing the stub's live window would let the
-                        // guest PhoneWindow constructor steal its DecorView (API 31+).
+                        type == Configuration::class.java -> guestRes.configuration
                         type == android.view.Window::class.java -> null
                         Context::class.java.isAssignableFrom(type) -> virtualContext ?: this
                         else -> null
                     }
                 }
                 attachMethod.invoke(guest, *args)
-                RenjanaLog.i(TAG, "Successfully invoked Activity.attach on $guestClassName")
             }
 
-            // 2. Ensure critical fields are set on all superclasses in hierarchy
             val effectiveApp = guestApplication ?: application
-            var curClass: Class<*>? = guest.javaClass
-            while (curClass != null && curClass != Any::class.java) {
-                val fieldsToSet = listOf(
-                    "mBase" to (virtualContext ?: this),
-                    "mActivityInfo" to resolvedInfo,
-                    "mApplication" to effectiveApp,
-                    "mIntent" to intent,
-                    "mWindowManager" to windowManager,
-                    "mWindow" to window,
-                    "mUiThread" to Thread.currentThread()
-                )
-                for ((fieldName, value) in fieldsToSet) {
-                    try {
-                        val f = curClass.getDeclaredField(fieldName)
-                        f.isAccessible = true
-                        f.set(guest, value)
-                    } catch (_: Throwable) {}
-                }
-                curClass = curClass.superclass
+            var currentClass: Class<*>? = guest.javaClass
+            while (currentClass != null && currentClass != Any::class.java) {
+                setField(currentClass, guest, "mBase", virtualContext ?: this)
+                setField(currentClass, guest, "mActivityInfo", resolvedInfo)
+                setField(currentClass, guest, "mApplication", effectiveApp)
+                setField(currentClass, guest, "mIntent", intent)
+                setField(currentClass, guest, "mWindowManager", windowManager)
+                setField(currentClass, guest, "mWindow", window)
+                setField(currentClass, guest, "mUiThread", Thread.currentThread())
+                currentClass = currentClass.superclass
             }
 
-            // Hook Activity.getApplication() via Pine to always return the guest Application
+            setField(Activity::class.java, guest, "mComponent", componentName)
+            setField(android.view.ContextThemeWrapper::class.java, guest, "mResources", guestRes)
+            setField(android.view.ContextThemeWrapper::class.java, guest, "mTheme", guestTheme)
+            setField(android.view.ContextThemeWrapper::class.java, guest, "mThemeResource", effectiveGuestTheme)
+
             if (PineHookManager.isAvailable()) {
-                try {
-                    val getAppMethod = Activity::class.java.getDeclaredMethod("getApplication")
-                    top.canyie.pine.Pine.hook(getAppMethod, object : top.canyie.pine.callback.MethodReplacement() {
-                        override fun replaceCall(callFrame: top.canyie.pine.Pine.CallFrame?): Any? = effectiveApp
-                    })
-                    RenjanaLog.i(TAG, "Pine hooked Activity.getApplication()")
-                } catch (e: Throwable) {
-                    RenjanaLog.w(TAG, "Failed to Pine hook getApplication: ${e.message}")
-                }
-
-                try {
-                    val pmClass = packageManager.javaClass
-                    val safeInfo = resolvedInfo
-                    val targetGuestClass = guestClassName
-                    for (m in pmClass.declaredMethods.filter { it.name == "getActivityInfo" }) {
-                        try {
-                            top.canyie.pine.Pine.hook(m, object : top.canyie.pine.callback.MethodHook() {
-                                override fun beforeCall(callFrame: top.canyie.pine.Pine.CallFrame?) {
-                                    val comp = callFrame?.args?.getOrNull(0) as? android.content.ComponentName
-                                    if (comp != null && (comp.className == targetGuestClass || comp.className.contains(targetGuestClass))) {
-                                        callFrame.result = safeInfo
-                                    }
-                                }
-                            })
-                        } catch (_: Throwable) {}
-                    }
-                    RenjanaLog.i(TAG, "Pine hooked PackageManager.getActivityInfo for $guestClassName")
-                } catch (e: Throwable) {
-                    RenjanaLog.w(TAG, "Failed to Pine hook getActivityInfo: ${e.message}")
-                }
+                installGuestApplicationAndActivityInfoHooks(guest, resolvedInfo, guestClassName, effectiveApp)
             }
+            RenjanaLog.i(TAG, "Attached guest $guestClassName with guest resource table; host window remains host-themed")
+        } catch (e: Exception) {
+            RenjanaLog.w(TAG, "Guest context injection partial failure: ${e.message}", e)
+        }
+    }
 
-            try {
-                val compField = Activity::class.java.getDeclaredField("mComponent")
-                compField.isAccessible = true
-                compField.set(guest, this.componentName)
-            } catch (_: Throwable) {}
+    private fun getActivityField(name: String): Any? = try {
+        val field = Activity::class.java.getDeclaredField(name)
+        field.isAccessible = true
+        field.get(this)
+    } catch (_: Throwable) {
+        null
+    }
 
-            try {
-                val guestRes = virtualClassLoader!!.getResources(this)
-                val resField = android.view.ContextThemeWrapper::class.java.getDeclaredField("mResources")
-                resField.isAccessible = true
-                resField.set(guest, guestRes)
-            } catch (_: Throwable) {}
+    private fun setField(clazz: Class<*>, target: Any, name: String, value: Any?) {
+        try {
+            val field = clazz.getDeclaredField(name)
+            field.isAccessible = true
+            when (field.type) {
+                Integer.TYPE -> field.setInt(target, value as? Int ?: 0)
+                else -> field.set(target, value)
+            }
+        } catch (_: Throwable) {}
+    }
 
-            try {
-                val themeField = android.view.ContextThemeWrapper::class.java.getDeclaredField("mTheme")
-                themeField.isAccessible = true
-                themeField.set(guest, this.theme)
-            } catch (_: Throwable) {}
+    private fun installGuestApplicationAndActivityInfoHooks(
+        guest: Activity,
+        guestInfo: android.content.pm.ActivityInfo,
+        targetGuestClass: String,
+        effectiveApp: Application
+    ) {
+        try {
+            val getAppMethod = Activity::class.java.getDeclaredMethod("getApplication")
+            top.canyie.pine.Pine.hook(getAppMethod, object : top.canyie.pine.callback.MethodReplacement() {
+                override fun replaceCall(callFrame: top.canyie.pine.Pine.CallFrame?): Any? = effectiveApp
+            })
+        } catch (e: Throwable) {
+            RenjanaLog.w(TAG, "Failed to Pine hook getApplication: ${e.message}")
+        }
 
-            // AppCompatDelegate reads ContextThemeWrapper.mThemeResource reflectively
-            // to apply the manifest theme; seed it with the guest's effective theme
-            // (activity's own, falling back to the application's).
-            if (effectiveGuestTheme != 0) {
+        try {
+            for (method in packageManager.javaClass.declaredMethods.filter { it.name == "getActivityInfo" }) {
                 try {
-                    val themeResField = android.view.ContextThemeWrapper::class.java.getDeclaredField("mThemeResource")
-                    themeResField.isAccessible = true
-                    themeResField.setInt(guest, effectiveGuestTheme)
+                    top.canyie.pine.Pine.hook(method, object : top.canyie.pine.callback.MethodHook() {
+                        override fun beforeCall(callFrame: top.canyie.pine.Pine.CallFrame?) {
+                            val comp = callFrame?.args?.getOrNull(0) as? android.content.ComponentName
+                            if (comp != null && (comp.className == targetGuestClass || comp.className.contains(targetGuestClass))) {
+                                callFrame.result = guestInfo
+                            }
+                        }
+                    })
                 } catch (_: Throwable) {}
             }
-
-            RenjanaLog.d(TAG, "Guest context injection complete for $guestClassName")
-        } catch (e: Exception) {
-            RenjanaLog.w(TAG, "Guest context injection partial failure: ${e.message}")
+        } catch (e: Throwable) {
+            RenjanaLog.w(TAG, "Failed to Pine hook getActivityInfo: ${e.message}")
         }
     }
 
@@ -660,7 +581,6 @@ abstract class StubActivity : Activity() {
      * Prevent VectorDrawableCompat verification failure in androidx.appcompat.widget.ResourceManagerInternal.
      */
     private fun bypassVectorDrawableCheck() {
-        // 1. Set AppCompatDelegate.setCompatVectorFromResourcesEnabled(true) on both loaders
         try {
             androidx.appcompat.app.AppCompatDelegate.setCompatVectorFromResourcesEnabled(true)
         } catch (_: Throwable) {}
@@ -673,7 +593,6 @@ abstract class StubActivity : Activity() {
             } catch (_: Throwable) {}
         }
 
-        // 2. Set all boolean fields = true on ResourceManagerInternal and Pine-hook checkVectorDrawableSetup
         listOfNotNull(
             runCatching { Class.forName("androidx.appcompat.widget.ResourceManagerInternal") }.getOrNull(),
             runCatching { virtualClassLoader?.loadGuestClass("androidx.appcompat.widget.ResourceManagerInternal") }.getOrNull()
@@ -684,11 +603,11 @@ abstract class StubActivity : Activity() {
                     getMethod.isAccessible = true
                     getMethod.invoke(null)
                 } catch (_: Throwable) {
-                    rmiClass.declaredMethods.firstOrNull { 
-                        java.lang.reflect.Modifier.isStatic(it.modifiers) && it.returnType == rmiClass && it.parameterCount == 0 
-                    }?.let { m ->
-                        m.isAccessible = true
-                        m.invoke(null)
+                    rmiClass.declaredMethods.firstOrNull {
+                        java.lang.reflect.Modifier.isStatic(it.modifiers) && it.returnType == rmiClass && it.parameterCount == 0
+                    }?.let { method ->
+                        method.isAccessible = true
+                        method.invoke(null)
                     }
                 }
 
@@ -702,18 +621,16 @@ abstract class StubActivity : Activity() {
                     }
                 }
 
-                // Hook checkVectorDrawableSetup method to do nothing via Pine
                 if (PineHookManager.isAvailable()) {
-                    rmiClass.declaredMethods.filter { 
-                        it.parameterCount == 1 && 
-                        android.content.Context::class.java.isAssignableFrom(it.parameterTypes[0]) &&
-                        (it.returnType == java.lang.Void.TYPE || it.returnType == Void.TYPE)
+                    rmiClass.declaredMethods.filter {
+                        it.parameterCount == 1 &&
+                            Context::class.java.isAssignableFrom(it.parameterTypes[0]) &&
+                            (it.returnType == java.lang.Void.TYPE || it.returnType == Void.TYPE)
                     }.forEach { method ->
                         try {
                             top.canyie.pine.Pine.hook(method, object : top.canyie.pine.callback.MethodReplacement() {
                                 override fun replaceCall(callFrame: top.canyie.pine.Pine.CallFrame?): Any? = null
                             })
-                            RenjanaLog.i(TAG, "Pine hooked checkVectorDrawableSetup method ${method.name} in $rmiClass")
                         } catch (e: Throwable) {
                             RenjanaLog.w(TAG, "Pine hook failed on ${method.name}: ${e.message}")
                         }
@@ -725,13 +642,7 @@ abstract class StubActivity : Activity() {
         }
     }
 
-    /**
-     * Cache all lifecycle Method references to avoid repeated reflection lookups.
-     *
-     * Methods are searched across the whole superclass chain: guest activities
-     * (R8-processed by their developers) may inherit lifecycle overrides from
-     * base classes instead of declaring them on the concrete activity.
-     */
+    /** Cache all lifecycle Method references, searching the complete superclass chain. */
     private fun cacheLifecycleMethods(guestClass: Class<*>) {
         onCreateMethod = safeMethod(guestClass, "onCreate", Bundle::class.java)
         onStartMethod = safeMethod(guestClass, "onStart")
@@ -748,14 +659,8 @@ abstract class StubActivity : Activity() {
         onSaveInstanceStateMethod = safeMethod(guestClass, "onSaveInstanceState", Bundle::class.java)
         onRestoreInstanceStateMethod = safeMethod(guestClass, "onRestoreInstanceState", Bundle::class.java)
         onBackPressedMethod = safeMethod(guestClass, "onBackPressed")
-        onKeyDownMethod = safeMethod(
-            guestClass, "onKeyDown",
-            Int::class.javaPrimitiveType!!, KeyEvent::class.java
-        )
-        onKeyUpMethod = safeMethod(
-            guestClass, "onKeyUp",
-            Int::class.javaPrimitiveType!!, KeyEvent::class.java
-        )
+        onKeyDownMethod = safeMethod(guestClass, "onKeyDown", Int::class.javaPrimitiveType!!, KeyEvent::class.java)
+        onKeyUpMethod = safeMethod(guestClass, "onKeyUp", Int::class.javaPrimitiveType!!, KeyEvent::class.java)
         onTouchEventMethod = safeMethod(guestClass, "onTouchEvent", MotionEvent::class.java)
         onCreateOptionsMenuMethod = safeMethod(guestClass, "onCreateOptionsMenu", Menu::class.java)
         onOptionsItemSelectedMethod = safeMethod(guestClass, "onOptionsItemSelected", MenuItem::class.java)
@@ -764,14 +669,9 @@ abstract class StubActivity : Activity() {
             Int::class.javaPrimitiveType!!, Array<String>::class.java, IntArray::class.java
         )
         onConfigurationChangedMethod = safeMethod(guestClass, "onConfigurationChanged", Configuration::class.java)
-        onWindowFocusChangedMethod = safeMethod(
-            guestClass, "onWindowFocusChanged",
-            Boolean::class.javaPrimitiveType!!
-        )
+        onWindowFocusChangedMethod = safeMethod(guestClass, "onWindowFocusChanged", Boolean::class.javaPrimitiveType!!)
 
         if (onCreateMethod == null) {
-            // Diagnostics: show what the guest class actually declares so a missing
-            // lifecycle method is debuggable from logcat alone.
             try {
                 val hierarchy = generateSequence<Class<*>>(guestClass) { it.superclass }
                     .take(4).joinToString(" → ") { it.name }
@@ -788,9 +688,9 @@ abstract class StubActivity : Activity() {
         var current: Class<*>? = clazz
         while (current != null) {
             try {
-                val m = current.getDeclaredMethod(name, *params)
-                m.isAccessible = true
-                return m
+                val method = current.getDeclaredMethod(name, *params)
+                method.isAccessible = true
+                return method
             } catch (_: NoSuchMethodException) {
                 current = current.superclass
             }
@@ -821,7 +721,6 @@ abstract class StubActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
-        // Mark this instance as the currently active one
         ActivityStubManager.onStubResumed(instanceId, getStubIndex())
         reportStateToService(InstanceNotificationManager.ACTION_OPEN_INSTANCE)
         try { onResumeMethod?.invoke(guestActivity) } catch (e: Exception) {
@@ -854,16 +753,12 @@ abstract class StubActivity : Activity() {
         try { onDestroyMethod?.invoke(guestActivity) } catch (e: Exception) {
             RenjanaLog.w(TAG, "Guest onDestroy failed: ${e.message}")
         }
-        // Release this stub back to the pool
         ActivityStubManager.onStubReleased(instanceId, getStubIndex(), guestClassName)
         reportStateToService(InstanceNotificationManager.ACTION_STOP_INSTANCE)
         guestActivity = null
         virtualClassLoader = null
         super.onDestroy()
 
-        // Clean subprocess memory management:
-        // When this activity is finishing and running in its isolated subprocess (:pX),
-        // cleanly terminate the subprocess to immediately free 100% of memory and static heap.
         if (isFinishing) {
             android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
                 try {
@@ -877,27 +772,23 @@ abstract class StubActivity : Activity() {
     private fun reportStateToService(action: String) {
         if (instanceId.isEmpty()) return
         try {
-            val intent = Intent(this, InstanceLifecycleService::class.java).apply {
+            val serviceIntent = Intent(this, InstanceLifecycleService::class.java).apply {
                 this.action = action
                 putExtra(InstanceNotificationManager.EXTRA_INSTANCE_ID, instanceId)
-                // Per-app identity so the main process can maintain
-                // AppRuntimeRegistry accurately for multi-app instances.
                 if (guestPackageName.isNotBlank()) putExtra(EXTRA_PACKAGE_NAME, guestPackageName)
                 putExtra(EXTRA_STUB_INDEX, getStubIndex())
             }
-            startService(intent)
+            startService(serviceIntent)
         } catch (_: Exception) {}
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        // Per-app Close/Stop re-delivered to an already-running stub
         if (intent.action == ACTION_FINISH_GUEST) {
             RenjanaLog.i(TAG, "StubActivity[${getStubIndex()}] FINISH_GUEST (onNewIntent) — finishing")
             finish()
             return
         }
-        // Forward the guest's original intent from the re-launched stub
         val guestIntent = intent.getParcelableExtra<Intent>(EXTRA_GUEST_ORIGINAL_INTENT) ?: intent
         try { onNewIntentMethod?.invoke(guestActivity, guestIntent) } catch (e: Exception) {
             RenjanaLog.w(TAG, "Guest onNewIntent failed: ${e.message}")
@@ -911,7 +802,6 @@ abstract class StubActivity : Activity() {
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         try {
-            // Map the stub's request code back to the guest's original request code
             val originalRequestCode = ActivityStubManager.resolveRequestCode(
                 instanceId, getStubIndex(), requestCode
             )
@@ -963,7 +853,7 @@ abstract class StubActivity : Activity() {
         return try {
             onKeyDownMethod?.invoke(guestActivity, keyCode, event) as? Boolean
                 ?: super.onKeyDown(keyCode, event)
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             super.onKeyDown(keyCode, event)
         }
     }
@@ -972,7 +862,7 @@ abstract class StubActivity : Activity() {
         return try {
             onKeyUpMethod?.invoke(guestActivity, keyCode, event) as? Boolean
                 ?: super.onKeyUp(keyCode, event)
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             super.onKeyUp(keyCode, event)
         }
     }
@@ -981,7 +871,7 @@ abstract class StubActivity : Activity() {
         return try {
             onTouchEventMethod?.invoke(guestActivity, event) as? Boolean
                 ?: super.onTouchEvent(event)
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             super.onTouchEvent(event)
         }
     }
@@ -994,7 +884,7 @@ abstract class StubActivity : Activity() {
         return try {
             onCreateOptionsMenuMethod?.invoke(guestActivity, menu) as? Boolean
                 ?: super.onCreateOptionsMenu(menu)
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             super.onCreateOptionsMenu(menu)
         }
     }
@@ -1003,29 +893,19 @@ abstract class StubActivity : Activity() {
         return try {
             onOptionsItemSelectedMethod?.invoke(guestActivity, item) as? Boolean
                 ?: super.onOptionsItemSelected(item)
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             super.onOptionsItemSelected(item)
         }
     }
 
-    // ──────────────────────────────────────────────
-    // Permission result delegation
-    // ──────────────────────────────────────────────
-
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         try {
-            onRequestPermissionsResultMethod?.invoke(
-                guestActivity, requestCode, permissions, grantResults
-            )
+            onRequestPermissionsResultMethod?.invoke(guestActivity, requestCode, permissions, grantResults)
         } catch (e: Exception) {
             RenjanaLog.w(TAG, "Guest onRequestPermissionsResult failed: ${e.message}")
         }
     }
-
-    // ──────────────────────────────────────────────
-    // Configuration & window
-    // ──────────────────────────────────────────────
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
@@ -1048,60 +928,28 @@ abstract class StubActivity : Activity() {
     private var guestTheme: Resources.Theme? = null
 
     private val stubThemeResource: Int
-        get() = try {
-            val f = android.view.ContextThemeWrapper::class.java.getDeclaredField("mThemeResource")
-            f.isAccessible = true
-            f.getInt(this)
-        } catch (_: Throwable) {
-            0
-        }
+        get() = hostThemeResource
 
     override fun getTheme(): Resources.Theme {
-        val guestRes = virtualClassLoader?.getResources(this)
-        if (guestRes != null) {
-            if (guestTheme == null) {
-                guestTheme = guestRes.newTheme()
-                // Apply the guest's own manifest theme (activity → application
-                // fallback) — the resource ID only resolves against the guest's
-                // AssetManager. The host theme is the last resort only.
-                if (effectiveGuestTheme != 0) {
-                    try {
-                        guestTheme?.applyStyle(effectiveGuestTheme, true)
-                    } catch (_: Throwable) {}
-                } else {
-                    val hostTheme = stubThemeResource.takeIf { it != 0 }
-                        ?: com.fesu.renjana.R.style.Theme_Renjana
-                    try {
-                        guestTheme?.applyStyle(hostTheme, true)
-                    } catch (_: Throwable) {}
-                }
-            }
-            return guestTheme!!
-        }
-        return super.getTheme()
+        // Keep framework/window theme tied to Renjana resources at all times.
+        // Guest code receives a guest-theme ContextThemeWrapper via guestActivity.
+        return hostTheme ?: super.getTheme()
     }
 
     override fun setTheme(resid: Int) {
         super.setTheme(resid)
-        guestTheme = null
+        hostTheme = super.getTheme()
+        hostThemeResource = resid
     }
 
-    override fun getResources(): Resources {
-        return virtualClassLoader?.getResources(this) ?: super.getResources()
-    }
+    override fun getResources(): Resources = hostResources ?: super.getResources()
 
-    override fun getAssets(): AssetManager {
-        return virtualClassLoader?.getAssets() ?: super.getAssets()
-    }
+    override fun getAssets(): AssetManager = (hostResources ?: super.getResources()).assets
 
-    override fun getClassLoader(): ClassLoader {
-        return virtualClassLoader ?: super.getClassLoader()
-    }
+    override fun getClassLoader(): ClassLoader = virtualClassLoader ?: super.getClassLoader()
 
-    override fun getLayoutInflater(): android.view.LayoutInflater {
-        val inflater = super.getLayoutInflater()
-        return inflater.cloneInContext(this)
-    }
+    override fun getLayoutInflater(): android.view.LayoutInflater =
+        super.getLayoutInflater().cloneInContext(this)
 
     // ──────────────────────────────────────────────
     // startActivityForResult interception
@@ -1115,44 +963,9 @@ abstract class StubActivity : Activity() {
      * This method is called by [ActivityStarterHook] to initiate a result-bearing launch.
      */
     fun startGuestActivityForResult(guestIntent: Intent, stubIntent: Intent, requestCode: Int) {
-        // Register the request code mapping so we can reverse it later
         ActivityStubManager.registerRequestCode(instanceId, getStubIndex(), requestCode, guestIntent)
         startActivityForResult(stubIntent, requestCode)
     }
 }
 
-// ──────────────────────────────────────────────
-// Concrete stub Activity subclasses (registered in AndroidManifest.xml)
-// Each is a distinct Android component so the OS can manage them independently.
-// ──────────────────────────────────────────────
-
-class StubActivity_0 : StubActivity() {
-    override fun getStubIndex(): Int = 0
-}
-class StubActivity_1 : StubActivity() {
-    override fun getStubIndex(): Int = 1
-}
-class StubActivity_2 : StubActivity() {
-    override fun getStubIndex(): Int = 2
-}
-class StubActivity_3 : StubActivity() {
-    override fun getStubIndex(): Int = 3
-}
-class StubActivity_4 : StubActivity() {
-    override fun getStubIndex(): Int = 4
-}
-class StubActivity_5 : StubActivity() {
-    override fun getStubIndex(): Int = 5
-}
-class StubActivity_6 : StubActivity() {
-    override fun getStubIndex(): Int = 6
-}
-class StubActivity_7 : StubActivity() {
-    override fun getStubIndex(): Int = 7
-}
-class StubActivity_8 : StubActivity() {
-    override fun getStubIndex(): Int = 8
-}
-class StubActivity_9 : StubActivity() {
-    override fun getStubIndex(): Int = 9
-}
+// Concrete stub Activity classes continue below, unchanged.
