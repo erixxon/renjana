@@ -3,6 +3,7 @@ package com.fesu.renjana.core
 import android.content.pm.ApplicationInfo
 import android.content.res.AssetManager
 import android.content.res.Resources
+import android.os.Build
 import dalvik.system.DexClassLoader
 import java.io.File
 
@@ -49,6 +50,15 @@ class VirtualClassLoader(
     private val allApkPaths: List<String> = resolveAllApkPaths(apkPath)
 
     init {
+        // Record the real runtime identity before guest fingerprint spoofing is applied.
+        // This distinguishes host-device diagnostics from values visible to guest apps.
+        com.fesu.renjana.utils.RenjanaLog.i(
+            "VirtualClassLoader",
+            "Runtime diagnostics: sdkInt=${Build.VERSION.SDK_INT}, release=${Build.VERSION.RELEASE}, " +
+                "incremental=${Build.VERSION.INCREMENTAL}, fingerprint=${Build.FINGERPRINT}, " +
+                "hostDevice=${Build.MANUFACTURER}/${Build.MODEL}; guest=$guestPackageName; apk=$apkPath"
+        )
+
         // Create optimized directory for this instance
         if (!optimizedDir.exists()) {
             optimizedDir.mkdirs()
@@ -160,15 +170,20 @@ class VirtualClassLoader(
                 String::class.java
             )
             addAssetPathMethod.isAccessible = true
+            var successfulPaths = 0
             for (path in allApkPaths) {
                 try {
                     val result = addAssetPathMethod.invoke(assetManager, path) as? Int
+                    if (result != null && result != 0) successfulPaths++
                     com.fesu.renjana.utils.RenjanaLog.i("VirtualClassLoader", "Added asset path: $path (cookie=$result)")
                 } catch (e: Exception) {
                     com.fesu.renjana.utils.RenjanaLog.w("VirtualClassLoader", "Failed to add asset path $path: ${e.message}")
                 }
             }
-            
+            if (successfulPaths == 0) {
+                throw IllegalStateException("AssetManager accepted none of the APK paths: $allApkPaths")
+            }
+            assetManager = assetManager
             return assetManager
         } catch (e: Exception) {
             throw RuntimeException("Failed to create AssetManager for $apkPath", e)
@@ -176,52 +191,67 @@ class VirtualClassLoader(
     }
 
     /**
-     * Create Resources for the guest APK using PackageManager where available,
-     * ensuring all splits and framework assets are properly linked.
+     * Create Resources from the imported APK archive first. Looking up Resources by
+     * package name first can silently select a different, installed build of the same
+     * package; its resource table may not contain the imported APK's IDs. That leads to
+     * Resources$NotFoundException even though the imported APK itself has the resource.
+     *
+     * The archive ApplicationInfo is populated with base + split paths so PackageManager
+     * can construct a resource table for this exact import. AssetManager is the fallback.
      */
     private fun createResources(context: android.content.Context): Resources {
+        val hostResources = context.resources
+        val packageManager = context.packageManager
+
         try {
-            val pm = context.packageManager
-            val targetPkg = guestPackageName ?: try {
-                pm.getPackageArchiveInfo(apkPath, 0)?.packageName
-            } catch (_: Throwable) { null }
-
-            if (!targetPkg.isNullOrEmpty()) {
-                try {
-                    val appRes = pm.getResourcesForApplication(targetPkg)
-                    com.fesu.renjana.utils.RenjanaLog.i("VirtualClassLoader", "Loaded Resources via PackageManager for $targetPkg")
-                    return appRes
-                } catch (e: Throwable) {
-                    com.fesu.renjana.utils.RenjanaLog.w("VirtualClassLoader", "Failed to get Resources for $targetPkg via PM: ${e.message}")
+            val packageInfo = packageManager.getPackageArchiveInfo(apkPath, 0)
+            val archiveInfo = packageInfo?.applicationInfo
+            if (archiveInfo != null) {
+                archiveInfo.sourceDir = apkPath
+                archiveInfo.publicSourceDir = apkPath
+                val splitPaths = allApkPaths.filter { it != apkPath }.toTypedArray()
+                if (splitPaths.isNotEmpty()) {
+                    archiveInfo.splitSourceDirs = splitPaths
+                    archiveInfo.splitPublicSourceDirs = splitPaths
                 }
+                val archiveResources = packageManager.getResourcesForApplication(archiveInfo)
+                com.fesu.renjana.utils.RenjanaLog.i(
+                    "VirtualClassLoader",
+                    "Loaded Resources from imported APK archive: package=${packageInfo.packageName}, " +
+                        "splits=${splitPaths.size}, sdkInt=${Build.VERSION.SDK_INT}"
+                )
+                return archiveResources
             }
-
-            val pkgInfo = pm.getPackageArchiveInfo(apkPath, 0)
-            if (pkgInfo?.applicationInfo != null) {
-                val ai = pkgInfo.applicationInfo
-                ai.sourceDir = apkPath
-                ai.publicSourceDir = apkPath
-                val splits = allApkPaths.filter { it != apkPath }.toTypedArray()
-                if (splits.isNotEmpty()) {
-                    ai.splitSourceDirs = splits
-                    ai.splitPublicSourceDirs = splits
-                }
-                val appRes = pm.getResourcesForApplication(ai)
-                com.fesu.renjana.utils.RenjanaLog.i("VirtualClassLoader", "Loaded Resources via ApplicationInfo archive for $apkPath")
-                return appRes
-            }
+            com.fesu.renjana.utils.RenjanaLog.w(
+                "VirtualClassLoader",
+                "PackageManager could not parse imported APK archive: $apkPath"
+            )
         } catch (e: Throwable) {
-            com.fesu.renjana.utils.RenjanaLog.w("VirtualClassLoader", "PackageManager getResources fallback to AssetManager: ${e.message}")
+            com.fesu.renjana.utils.RenjanaLog.w(
+                "VirtualClassLoader",
+                "Archive resource loading failed for $apkPath; trying APK AssetManager fallback: ${e.message}",
+                e
+            )
         }
 
-        val assets = getAssets()
-        val appRes = context.applicationContext?.resources ?: Resources.getSystem()
-        @Suppress("DEPRECATION")
-        return Resources(
-            assets,
-            appRes.displayMetrics,
-            appRes.configuration
-        )
+        try {
+            val assets = getAssets()
+            @Suppress("DEPRECATION")
+            val fallbackResources = Resources(assets, hostResources.displayMetrics, hostResources.configuration)
+            com.fesu.renjana.utils.RenjanaLog.i(
+                "VirtualClassLoader",
+                "Loaded Resources through imported APK AssetManager: apkPaths=$allApkPaths"
+            )
+            return fallbackResources
+        } catch (e: Throwable) {
+            com.fesu.renjana.utils.RenjanaLog.e(
+                "VirtualClassLoader",
+                "Unable to create guest Resources for package=$guestPackageName apk=$apkPath; " +
+                    "runtime sdkInt=${Build.VERSION.SDK_INT}, release=${Build.VERSION.RELEASE}",
+                e
+            )
+            throw e
+        }
     }
 
     /**
@@ -234,11 +264,11 @@ class VirtualClassLoader(
                 .getDeclaredField("pathList")
             pathListField.isAccessible = true
             val pathList = pathListField.get(dexClassLoader)
-            
+
             val nativeLibraryDirectoriesField = pathList.javaClass
                 .getDeclaredField("nativeLibraryDirectories")
             nativeLibraryDirectoriesField.isAccessible = true
-            
+
             val dirs = nativeLibraryDirectoriesField.get(pathList) as List<File>
             val newDirs = ArrayList(dirs)
             newDirs.add(File(libPath))
